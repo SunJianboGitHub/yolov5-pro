@@ -36,7 +36,7 @@ from utils.metrics import BboxIoU
 
 
 class ComputeLoss(nn.Module):
-    def __init__(self, num_classes=20, anchors=[], hyp=None, device="cuda"):
+    def __init__(self, num_classes=20, anchors=[], hyp=None, device="cuda", box_reg="SIoU"):
         super().__init__()
         self.device = device                                                    # 确定计算loss在那个设备上
         self.hyp = hyp                                                          # 超参数
@@ -63,7 +63,7 @@ class ComputeLoss(nn.Module):
         self.BCE_classification = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([self.hyp.get('cls_pw', 1.0)], device=self.device))                            # 多个二元交叉熵损失
         self.balance = [4.0, 1.0, 0.4] if len(anchors) == 3 else [4.0, 1.0, 0.4, 0.1]               # 针对三个尺度上的 objectness损失的平衡策略 8, 16, 32
         
-        self.IoU_box_regression = BboxIoU("CIoU", eps=1e-7)
+        self.IoU_box_regression = BboxIoU(method=box_reg, eps=1e-7)
 
 
 
