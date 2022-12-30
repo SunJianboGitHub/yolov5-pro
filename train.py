@@ -13,13 +13,15 @@ import os
 import sys
 import time
 import torch
+import torchvision
 import visdom
 import argparse
+import shutil
 import numpy as np
 from pathlib import Path
 
 from tqdm import tqdm
-
+from datetime import datetime
 
 import torch.optim as optim
 
@@ -47,9 +49,18 @@ from utils.tensorbord_utils import LogRecoder                       # 用于Tens
 from utils.sparse_bn import OptimizerBN                             # 用于稀疏化训练,也就是通道剪枝训练                      
 
 
+MEAN = [0.485, 0.456, 0.406]                                            # ImageNet上的图像均值, RGB通道
+STD  = [0.229, 0.224, 0.225]                                            # ImageNet上的图像标准差, RGB通道
+
+COCO_MEAN = [0.471, 0.448, 0.408]                                            # COCO上的图像均值, RGB通道
+COCO_STD  = [0.234, 0.239, 0.242]                                            # COCO上的图像标准差, RGB通道
+
 
 
 BAR_FORMAT = '{l_bar}{bar:10}{r_bar}{bar:-10b}'  # tqdm bar format
+# BAR_FORMAT = '{l_bar}{bar:10}{r_bar}{bar:-10b}'  # tqdm bar format
+
+NCOLS = 0 if True else shutil.get_terminal_size().columns
 
 
 
@@ -72,7 +83,9 @@ def train(args, hyp):
     last_pt = weight_dir + os.sep + "last.pt"
     best_pt = weight_dir + os.sep + "best.pt"
     
-    results_file = log_dir + os.sep + "results.txt"
+    
+    tensorboard_logs = LogRecoder(log_dir=log_dir, flush_secs=10)
+    args.tbd_logs = tensorboard_logs
     
     
     # 随机布种
@@ -88,9 +101,7 @@ def train(args, hyp):
     accumulate = max(round(nbs / args.batch_size), 1)                                                                                                   # accumulate loss before optimizing
     hyp['weight_decay'] *= args.batch_size * accumulate / nbs                                                                                           # scale weight_decay
     optimizer = smart_optimizer(model, name=args.optimizer, lr=hyp["lr0"], momentum=hyp["momentum"], decay=hyp["weight_decay"])                         # 智能优化器
-    scheduler, lf = acquire_lr_scheduler(optimizer, hyp["lrf"], epochs=args.epochs, T=args.epochs, cos_lr=args.cos_lr)                                  # 学习率scheduler,最终学习率通过超参数lrf设置
-    
-    ema_model = ModelEMA(model)                                                                                                                         # 模型的指数滑动平均
+    scheduler, lf = acquire_lr_scheduler(optimizer, hyp["lrf"], epochs=args.epochs, cos_lr=args.cos_lr, T=100, decay_rate=0.9)                          # 学习率scheduler,最终学习率通过超参数lrf设置
     
     # 加载预训练权重到模型, 这里只是加载参数
     if args.weights != "":
@@ -99,7 +110,7 @@ def train(args, hyp):
     # 根据检查点文件,恢复模型训练,不仅恢复模型参数,还有优化器、学习率、epoch等等。
     start_epoch, best_map = 0, 0.0                                                                                                                      # 起始epoch，最好的mAP
     if args.resume != "":
-        start_epoch, best_map = smart_resume(model, optimizer, args.resume, results_file, args.device, ema=None, epochs=args.epochs)
+        start_epoch, best_map = smart_resume(model, optimizer, args.resume, args.device, epochs=args.epochs)
     
     
     # Mixed precision training https://github.com/NVIDIA/apex
@@ -107,6 +118,10 @@ def train(args, hyp):
     if mixed_precision:
         model, optimizer = amp.initialize(model, optimizer, opt_level='O1', verbosity=0)
         is_amp = True
+    
+    # 模型恢复,或者加载预训练权重之后构建滑动平均模型
+    ema_model = ModelEMA(model)                                                                                                                         # 模型的指数滑动平均
+    
     
     
     train_dataloader, _ = create_dataloader(datas_path=args.train_path,                                # 数据集的路径
@@ -133,7 +148,7 @@ def train(args, hyp):
     # 开始启动训练
     start_time = time.time()                                                                        # 记录起始时间
     num_batch = len(train_dataloader)                                                               # 数据集一共包括多少个batch
-    iters_warmup = max(round(hyp["warmup_epochs"] * num_batch), 100)                                # 学习率预热，最高100次迭代或者3个epochs
+    iters_warmup = max(round(hyp["warmup_epochs"] * num_batch), 100)                                # 学习率预热，最少100次迭代或者3个epochs
     
     last_opt_step = -1
     scheduler.last_epoch = start_epoch - 1
@@ -141,7 +156,7 @@ def train(args, hyp):
     
     results = (0, 0, 0, 0, 0, 0, 0)                                                                 # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
 
-    loss_func = ComputeLoss(num_classes=nc, anchors=model.anchors, hyp=hyp)
+    loss_func = ComputeLoss(num_classes=nc, anchors=model.anchors, hyp=hyp, device=args.device, box_reg="SIoU")
     
     
     # --------------------------------Start Training----------------------------------
@@ -151,35 +166,44 @@ def train(args, hyp):
         model.train()                                                                                                                   # 开启训练模式
         
         mloss = torch.zeros(3, device=args.device)                                                                                      # 记录平均损失
-        logger.info(('\n' + '%11s' * 9) % ('Epoch', 'GPU_mem', 'box_loss', 'obj_loss', 'cls_loss', 'num_objs', 'matched_num_mean', 'unmatched_num_target', 'Size'))
-        pbar = tqdm(enumerate(train_dataloader), total=num_batch, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')                        # 进度条
+        logger.info(('\n' + '%11s' * 9) % ('Epoch', 'GPU_mem', 'box_loss', 'obj_loss', 'cls_loss', 'num_objs', 'matched', 'unmatched', 'Size'))
+        pbar = tqdm(enumerate(train_dataloader), total=num_batch, ncols=NCOLS, bar_format=BAR_FORMAT)                        # 进度条
         
         optimizer.zero_grad()                                                                                                           # 梯度置为零
-        for i, (imgs, targets, visual_info) in pbar:                                                                                     # 遍历每一批次的数据
+        for i, (imgs, targets, visual_info) in pbar:                                                                                    # 遍历每一批次的数据
             num_iters = i + num_batch * epoch                                                                                           # 当前的迭代次数，用于控制warmup
             
             # Warmup操作
             if num_iters < iters_warmup:                                                                                                # 如果满足warmup
                 xi = [0, iters_warmup]                                                                                                  # x 插值
-                accumulate = max(1, np.interp(num_iters, xi, [1, nbs / args.batch_size]).round())
+                accumulate = max(1, np.interp(num_iters, xi, [1, nbs / args.batch_size]).round())                                       # 表示积累到一定程度，再进行梯度更新, 一共积累64张图像的梯度
                 for j, x in enumerate(optimizer.param_groups):
                     # bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
-                    x['lr'] = np.interp(num_iters, xi, [hyp['warmup_bias_lr'] if j == 0 else 0.0, x['initial_lr'] * lf(epoch)])
+                    x['lr'] = np.interp(num_iters, xi, [0.1 if j == 2 else 0.0, x['initial_lr'] * lf(epoch)])                           # 注意起始值
+                    # x['lr'] = np.interp(num_iters, xi, [hyp['warmup_bias_lr'] if j == 0 else 0.0, x['initial_lr'] * lf(epoch)])
                     if 'momentum' in x:
                         x['momentum'] = np.interp(num_iters, xi, [hyp['warmup_momentum'], hyp['momentum']])
             
             imgs, targets = imgs.to(args.device).float() / 255, targets.to(args.device)
+            imgs = torchvision.transforms.Normalize(mean=COCO_MEAN, std=COCO_STD)(imgs)                                                  # 这里训练需要和评估保持一致，要归一化都归一化
+            
             predicts = model(imgs)
             total_loss, loss_items, (matched_num_mean, unmatched_num_target) = loss_func(predicts, targets)
             
-            optimizer.zero_grad()
+            # optimizer.zero_grad()                                 # 如果每一个迭代步都需要更新,这里解除注释
             total_loss.backward()
             
             
             # BN权重的L1正则化
             optimizer_bn.update_bn(epoch)
-        
-            optimizer.step()
+
+            # 这里没64张图像的累加梯度之后,进行一次梯度更新
+            # 如果是单个迭代步更新,这里直接optimizer.step()
+            if num_iters % accumulate == 0:
+                optimizer.step()
+                optimizer.zero_grad()
+                if ema_model is not None:
+                    ema_model.update(model)
             
            
             mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
@@ -194,7 +218,7 @@ def train(args, hyp):
             
             # tensorboard显示loss曲线
             args.tbd_logs.add_line(tag_name="loss/total_loss", 
-                                   scaler_value=total_loss.detach().cpu().item(), 
+                                   scaler_value=total_loss.detach().cpu().item() / args.batch_size, 
                                    global_step=num_iters)
             
             args.tbd_logs.add_lines(tag_name="loss/single_loss", 
@@ -213,7 +237,6 @@ def train(args, hyp):
             # args.vis.image(show_img[..., ::-1], win="visual_image")
             
             
-            
 
         # 展示BN层权重分布
         # TensorBoard显示BN层权重分布
@@ -225,6 +248,7 @@ def train(args, hyp):
         
         
         # Scheduler
+        # 如果在这里显示学习率,把这里解除注释
         lr = [x['lr'] for x in optimizer.param_groups]  # for loggers
         scheduler.step()
         
@@ -232,7 +256,7 @@ def train(args, hyp):
         args.tbd_logs.add_line(tag_name="learning_rate", scaler_value=lr[0], global_step=epoch)
         
         
-        if epoch > 1 and epoch % 5 ==0:
+        if epoch >= 0 and epoch % 2 ==0:
             # 验证集评估
             # AP50, AP75, mAP, compare_img = estimate_self(model, args.val_path, method="interp11", num_cls=nc, image_size=args.img_size, batch_size=args.batch_size, 
             #                         num_workers=args.num_workers)
@@ -241,9 +265,12 @@ def train(args, hyp):
             #                              batch_size=args.batch_size, num_workers=args.num_workers, nms_max_output_det=30000, 
             #                              nms_thres=0.5, conf_thres=0.001, device=args.device)
             
-            mAP, AP50, AP75, compare_img = new_estimate_coco(model, args.val_path, prefix=args.prefix, label_map=args.label_map, 
+            # 这里是采用的滑动平均模型进行评估的
+            mAP, AP50, AP75, compare_img = new_estimate_coco(ema_model.ema, args.val_path, prefix=args.prefix, label_map=args.label_map, 
                                                              image_size=args.img_size, batch_size=args.batch_size, num_workers=args.num_workers, 
                                                              nms_max_output_det=30000,nms_thres=0.5, conf_thres=0.001, device=args.device)
+            
+            
             
             # 传递过来的OpenCV的格式,也就是HWC
             compare_img = np.transpose(compare_img[..., ::-1], (2, 0, 1))
@@ -254,8 +281,8 @@ def train(args, hyp):
             
             
             
-            logger.info(('%11s' * 4) % ('Epoch', 'AP@0.5', 'AP@0.75', 'mAP'))
-            logger.info(('%11s' * 1 + '%11.4g' * 3) % (f'{epoch}/{args.epochs - 1}', AP50, AP75, mAP))
+            logger.info(('%13s' * 4) % ('Epoch', 'AP@0.5', 'AP@0.75', 'mAP'))
+            logger.info(('%13s' * 1 + '%13.4g' * 3) % (f'{epoch}/{args.epochs - 1}', AP50, AP75, mAP))
             
             # TensorBoard显示mAP曲线,显示多个曲线
             args.tbd_logs.add_lines(tag_name="evaluate/mAP", 
@@ -268,7 +295,25 @@ def train(args, hyp):
             # args.vis.line([AP50], [epoch], win="mAP-new-coco", update="append", name="AP50")
             # args.vis.line([AP75], [epoch], win="mAP-new-coco", update="append", name="AP75")
 
-
+        
+            # 保存最好的模型
+            # ---------------------------save best mAP model-----------------------------------
+            if best_map < mAP:
+                best_map = mAP
+                ckpt = {
+                    "epoch": epoch, 
+                    "best_map": best_map,
+                    "optimizer": optimizer.state_dict(),
+                    "model": ema_model.ema.state_dict(),                                                        # 保存的是滑动平均模型
+                    "date": datetime.now().isoformat()
+                }
+                
+                torch.save(ckpt, best_pt)
+                del ckpt
+            # --------------------------------finished-------------------------------------------
+            # 保存完毕
+        
+        
     return 0
 
 
@@ -283,23 +328,23 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--model_cfg", type=str, default="/workspace/yolov5-pro/models/yolov5s-v2.yaml", help="Network yaml config file.")
-    parser.add_argument("--train_path", type=str, default="/workspace/datasets/PASCAL_VOC2007/VOC2007_trainval/debug.txt", help="Datasets trainval.txt path.")
-    parser.add_argument("--val_path", type=str, default="/workspace/datasets/PASCAL_VOC2007/VOC2007_trainval/debug.txt", help="Datasets val.txt path.")
+    parser.add_argument("--model_cfg", type=str, default="/workspace/yolov5-pro/models/yolov5s.yaml", help="Network yaml config file.")
+    parser.add_argument("--train_path", type=str, default="/workspace/datasets/PASCAL_VOC2007/VOC2007_trainval/trainval_yolo.txt", help="Datasets trainval.txt path.")
+    parser.add_argument("--val_path", type=str, default="/workspace/datasets/PASCAL_VOC2007/VOC2007_trainval/val_yolo.txt", help="Datasets val.txt path.")
     
-    parser.add_argument("--save_dir", type=str, default="/workspace/yolov5-pro/runs/train/exp1", help="Save weights and logs.")
-    parser.add_argument('--resume', type=str, default="", help='resume from path/to/last.pt, or restart run if blank.')
+    parser.add_argument("--save_dir", type=str, default="/workspace/yolov5-pro/runs/train/exp3", help="Save weights and logs.")
+    parser.add_argument('--resume', type=str, default="/workspace/yolov5-pro/runs/train/exp3/weights/best.pt", help='resume from path/to/last.pt, or restart run if blank.')
     parser.add_argument("--img_size", type=int, default=640, help="Image size")
-    parser.add_argument("--epochs", type=int, default=100, help="Train epochs.")
-    parser.add_argument("--batch_size", type=int, default=16, help="Batch size.")
+    parser.add_argument("--epochs", type=int, default=1000, help="Train epochs.")
+    parser.add_argument("--batch_size", type=int, default=32, help="Batch size.")
     parser.add_argument("--optimizer", type=str, default="SGD", help="Optimizer method.")
     parser.add_argument("--cos_lr", type=bool, default=True, help="cosine lr.")
     
-    parser.add_argument("--augment", type=bool, default=False, help="Images augmentation for trainning.")
-    parser.add_argument("--mixed_aug", type=bool, default=False, help="Mosaic and center scale")
+    parser.add_argument("--augment", type=bool, default=True, help="Images augmentation for trainning.")
+    parser.add_argument("--mixed_aug", type=bool, default=True, help="Mosaic and center scale")
     parser.add_argument("--mosaic_num", type=list, default=[4], help="You can set [4, 9, 16, 25]")
     parser.add_argument("--cache_images", type=bool, default=False, help="Load all images to RAM.")
-    parser.add_argument("--prefix", type=str, default="debug", help="Prefix is used mark datasets.")
+    parser.add_argument("--prefix", type=str, default="trainval", help="Prefix is used mark datasets.")
     parser.add_argument("--weights", type=str, default="", help="Init weights path.weights/yolov5s.pt")
 
 
@@ -318,19 +363,20 @@ if __name__ == "__main__":
     # train_args.vis = vis
     
     
-    tensorboard_logs = LogRecoder(log_dir=os.path.join(train_args.save_dir, "logs"), flush_secs=10)
-    train_args.tbd_logs = tensorboard_logs
+    # tensorboard_logs = LogRecoder(log_dir=os.path.join(train_args.save_dir, "logs"), flush_secs=10)
+    # train_args.tbd_logs = tensorboard_logs
     
     
     
     hyp = {
+        # 最大学习率是lr0, 最小学习率是了lr0 * lrf
         "lr0": 0.01,  # initial learning rate (SGD=1E-2, Adam=1E-3)
-        "lrf": 0.15,  # final OneCycleLR learning rate (lr0 * lrf)
+        "lrf": 0.001,  # final OneCycleLR learning rate (lr0 * lrf)default=0.15
         "momentum": 0.937,  # SGD momentum/Adam beta1
-        "weight_decay": 0.0001,  # optimizer weight decay 5e-4
+        "weight_decay": 0.00001,  # optimizer weight decay 5e-4
         "warmup_epochs": 3.0,  # warmup epochs (fractions ok)
         "warmup_momentum": 0.8,  # warmup initial momentum
-        "warmup_bias_lr": 0.1,  # warmup initial bias lr
+        "warmup_bias_lr": 0.001,  # warmup initial bias lr
         "sr": 0.001,            # sparse rate
         "box": 0.05,  # box loss gain
         "cls": 0.3,  # cls loss gain
