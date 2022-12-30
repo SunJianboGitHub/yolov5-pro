@@ -58,11 +58,14 @@ BAR_FORMAT = '{l_bar}{bar:10}{r_bar}{bar:-10b}'  # tqdm bar format
 MEAN = [0.485, 0.456, 0.406]                                            # ImageNet上的图像均值, RGB通道
 STD  = [0.229, 0.224, 0.225]                                            # ImageNet上的图像标准差, RGB通道
 
+COCO_MEAN = [0.471, 0.448, 0.408]                                            # COCO上的图像均值, RGB通道
+COCO_STD  = [0.234, 0.239, 0.242]                                            # COCO上的图像标准差, RGB通道
+
 # 多图像进行归一化和标准化, 转换成tensor
 def transform_image_totensor(image):
     trans = torchvision.transforms.Compose([
         torchvision.transforms.ToTensor(),
-        torchvision.transforms.Normalize(mean=MEAN, std=STD)
+        torchvision.transforms.Normalize(mean=COCO_MEAN, std=COCO_STD)
     ])
     return trans(image)
 
@@ -257,9 +260,9 @@ class LoadImagesAndLabels(Dataset):
                     if self.alb_pixel_aug:
                         image = AlbPixelAugment.apply(image)                            # alb 像素增广
             else:                                                                   # 只进行马赛克增强, 这里的缺点是anchor和增强数据不匹配, 在anchor-free场景中最合适
-                if False and isinstance(self.mosaic_nums, int):
+                if isinstance(self.mosaic_nums, int):
                     image, norm_bboxes = self.load_mosaic(index, self.mosaic_nums)
-                elif False and isinstance(self.mosaic_nums, list):
+                elif isinstance(self.mosaic_nums, list):
                     image, norm_bboxes = self.load_mosaic(index, self.mosaic_nums[random.randint(0, len(self.mosaic_nums)-1)])
                 else:
                     image, norm_bboxes = self.load_mosaic(index, num=4) 
