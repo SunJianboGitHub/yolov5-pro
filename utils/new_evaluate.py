@@ -19,10 +19,18 @@ sys.path.append("..")
 
 from utils.dataset import create_dataloader
 
+MEAN = [0.485, 0.456, 0.406]                                            # ImageNet上的图像均值, RGB通道
+STD  = [0.229, 0.224, 0.225]                                            # ImageNet上的图像标准差, RGB通道
+
+COCO_MEAN = [0.471, 0.448, 0.408]                                            # COCO上的图像均值, RGB通道
+COCO_STD  = [0.234, 0.239, 0.242]                                            # COCO上的图像标准差, RGB通道
+
 
 # 这个就是需要提供的label_map的样式
 VOC_NAMES = ["aeroplane", "bicycle", "bird", "boat","bottle", "bus", "car", "cat", "chair", "cow",
              "diningtable", "dog", "horse", "motorbike", "person", "pottedplant",  "sheep",  "sofa",  "train", "tvmonitor"]
+
+NCOLS = 0 if True else shutil.get_terminal_size().columns
 
 
 
@@ -298,10 +306,13 @@ def generate_gt_pt_json(model, val_img_txt, prefix, img_size=640, batch_size=32,
     show_gt_pt_dict = dict()
     
     with torch.no_grad():
-        pbar = pbar = tqdm(enumerate(data_loader), total=len(data_sets)//batch_size, desc="Compute mAP...")
+        pbar = pbar = tqdm(enumerate(data_loader), ncols=NCOLS, total=len(data_sets)//batch_size, desc="Compute mAP...")
         for i, (images, labels, visual_info) in pbar:
             tmp_img = images.numpy()                                                                # 用于模型检测效果展示
             images = images.to(device, non_blocking=True).float() / 255
+            images = torchvision.transforms.Normalize(mean=COCO_MEAN, std=COCO_STD)(images)
+            
+            
             predictions = model(images).detach()
             predictions = non_max_suppression(predictions, iou_thres=nms_thres, conf_thres=conf_thres, max_output_det=max_det)
             
