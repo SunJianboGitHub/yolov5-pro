@@ -59,6 +59,7 @@ def plot_lr_scheduler(optimizer, scheduler, epochs=300, save_dir=""):
     optimizer, scheduler = copy(optimizer), copy(scheduler)
     y = []
     for _ in range(epochs):
+        optimizer.step()
         scheduler.step()
         y.append(optimizer.param_groups[0]["lr"])
 
