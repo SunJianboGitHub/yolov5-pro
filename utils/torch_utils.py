@@ -25,8 +25,8 @@ def initialize_weights(model):
         elif m_type is nn.BatchNorm2d:
             m.eps = 1e-3                            # 默认是 1e-5, 分母中添加一个值,为了计算稳定性
             m.momentmum = 0.03                      # 默认是 0.1, 一个运行过程中均值和方差的一个估计参数
-            nn.init.normal_(m.weight.data, mean=0, std=1)                           # 初始化为标准正态分布
-            nn.init.constant_(m.bias.data, 0)
+            # nn.init.normal_(m.weight.data, mean=0, std=1)                           # 初始化为标准正态分布
+            # nn.init.constant_(m.bias.data, 0)
         elif m_type in [nn.Hardswish, nn.LeakyReLU, nn.ReLU, nn.ReLU6, nn.SiLU]:
             m.inplace = True
     pass
@@ -76,29 +76,29 @@ def fuse_conv_and_bn(conv, bn):
 def parameters_group(model):
     """
         # 返回值参数：
-            1. pg0 是指卷积层的weight,yolov5只对卷积层weight进行权重衰减
-            2. pg1 是指BN层的weight
-            3. pg2 是指所有网络层的bias
+            1. pg0 是指卷积层的weight,yolov5只对卷积层weight进行权重衰减, weight with decay
+            2. pg1 是指BN层的weight, weight no decay
+            3. pg2 是指所有网络层的bias, biases no decay
     
     """
     
     # 将优化器参数分为3个小组，分别设置不同的优化器参数
     pg0, pg1, pg2 = [], [], []
     for k, v in model.named_parameters():
-        if ".bias" in k:                                # 这里包括卷积核BN层的bias
+        if ".bias" in k:                                # 这里包括BN层的bias，检测头的卷积bias
             pg2.append(v)
-        elif "weight" in k and ".bn" not in k:          # 这里是指卷积层的weight,不包括BN层的weight
-            pg0.append(v)
-        else:
-            pg1.append(v)                               # 这里其实就是BN层的weight
+        elif "weight" in k and ".bn" in k:              # 这里是指BN的weight
+            pg1.append(v)
+        elif "weight" in k and ".bn" not in k:          # 卷积的权重
+            pg0.append(v)                               # 这里其实就是卷积层的weight
             
-    print('Optimizer groups: %g .bias, %g conv.weight, %g other' % (len(pg2), len(pg1), len(pg0)))
+    print('Optimizer groups: %g conv.weight(with decay), %g BN.weight(no decay), %g bias(no decay)' % (len(pg0), len(pg1), len(pg2)))
     return pg0, pg1, pg2
 
 
 
 # 学习率调度器, 学习率策略
-def acquire_lr_scheduler(optimizer, lrf=0.001, epochs=100, T=100, cos_lr=True, save_dir=""):
+def acquire_lr_scheduler(optimizer, lrf=0.001, epochs=100, cos_lr=True, T=100, decay_rate=0.90, save_dir=""):
     """
         ### 学习率公式：
             1. 余弦退火学习率, eta_min + (1/2) *(eta_max-eta_min) * (1 + cos(x * pi / epochs))
@@ -107,11 +107,14 @@ def acquire_lr_scheduler(optimizer, lrf=0.001, epochs=100, T=100, cos_lr=True, s
             4. cos_lr, 选择余弦学习率,还是线性学习率
     """
     if cos_lr:
-        lf = lambda x: (((1 + math.cos(x * math.pi / epochs)) / 2) ** 1.0) * (1 - lrf) + lrf                  # 余弦退火学习率 
+        # lf = lambda x: ((1 + math.cos(x * math.pi / epochs)) / 2) * (1 - lrf) + lrf                                           # 余弦退火学习率,yolov5中的one_cycle就是余弦衰减
+        # lf = lambda x: ((1 + math.cos((x % T) * math.pi / T)) / 2) * (1 - lrf) + lrf                                          # 余弦退火 + 周期性重启 
+        lf = lambda x: (((1 + math.cos((x % T) * math.pi / T)) / 2) * (1 - lrf) + lrf) * (decay_rate ** (int(x / T)))           # 余弦退火 + 周期性重启 + 峰值衰减
     else:
-        lf = lambda x: (1 - x / epochs) * (1.0 - lrf) + lrf                                                   # 线性学习效率
-    # lf = lambda x: (((1 + math.cos((x % 50) * math.pi / 50)) / 2) ** 1.0) * 0.8 + 0.2               # 余弦退火 + 周期性重启
+        lf = lambda x: (1 - x / (epochs - 1)) * (1.0 - lrf) + lrf                                    # 线性学习效率
+        
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
+    
     return scheduler, lf
 
 
@@ -123,9 +126,9 @@ def smart_optimizer(model, name="Adam", lr=0.001, momentum=0.9, decay=1e-5):
             1. 对不同参数执行分组优化
             2. 优化器的选择, Adam AdamW RMSProp SGD
         ### 分组优化
-            1. weights with decay
-            2. weights no decay
-            3. biases no decay
+            1. pg0: conv weight (with decay)
+            2. pg1: BN weight (no decay)
+            3. pg2: bias (no decay)
     """
     pg0, pg1, pg2 = parameters_group(model)                                                             # 参数分组
     
@@ -149,7 +152,7 @@ def smart_optimizer(model, name="Adam", lr=0.001, momentum=0.9, decay=1e-5):
 
 
 # 智能恢复训练
-def smart_resume(model, optimizer, weights="yolov5s.pt", results_file="results.txt", device=None, ema=None, epochs=300):
+def smart_resume(model, optimizer, weights="yolov5s.pt", device=None, epochs=300):
     """
         ### 函数说明
             1. 根据检查点文件,恢复模型训练
@@ -171,28 +174,21 @@ def smart_resume(model, optimizer, weights="yolov5s.pt", results_file="results.t
     start_epoch, best_map = 0, 0.0
     
     assert weights.endswith(".pt") == True                                                  # 断言,确保权重文件正确
-    checkpoint = torch.load(weights, map_location=device)                                   # 加载检查点文件到指定设备
+    checkpoint = torch.load(weights, map_location="cpu")                                    # 加载检查点文件到指定设备
     
     # 开始逐步恢复
-    model.load_state_dict(checkpoint["model"])
+    model.load_state_dict(checkpoint["model"])                                              # 恢复模型权重 
+               
     if checkpoint["optimizer"] is not None:                                                                 # 如果检查点文件中包括优化器参数
-        optimizer.load_state_dict(checkpoint["optimizer"])                                                  # 加载优化器参数
-    
-    if ema and checkpoint.get("ema"):                                                                       # EMA（Exponential Moving Average）是指数移动平均值
-        ema.ema.load_state_dict(checkpoint["ema"].float().state_dict())
-        ema.updates = checkpoint["updates"]
-        
-    if checkpoint.get("training_results"):                                                                  # 如果训练结果存在
-        with open(results_file, "w") as f:                                                                  # 保存训练结果到本地
-            f.write(checkpoint["training_results"])
+        optimizer.load_state_dict(checkpoint["optimizer"])                                                  # 加载优化器参数  
             
     if checkpoint["epoch"] is not None:                                                                     # 确定恢复训练的起始轮数
         start_epoch = checkpoint["epoch"] + 1
-        if epochs < start_epoch:
+        if start_epoch < epochs:
             print("%s has been trained for %g epochs. Resume train util %g epochs." %(weights, start_epoch, epochs))
         else:
             print("%s has been trained for %g epochs. Resume train util %g epochs. train finished!!!" %(weights, start_epoch, epochs))
-            return None
+            return None, None
     if checkpoint.get("best_map"):
         best_map = checkpoint["best_map"]
         
@@ -212,14 +208,12 @@ def load_pretrained_weights(model, weights="weights/yolov5s.pt", device=None):
     
     if weights.endswith(".pt"):                                             # pytorch格式的权重文件
         
-        print("1111111111111111111")
         checkpoint = torch.load(weights, map_location="cpu")               # 加载检查点文件
-        print("222222222222222222222222")
         
         try:
             exclude = ["anchor"]                                            # 需要排除的keys, 每个任务的anchor是不同的,因此不需要加载
             ckpt_model = dict()
-            for k, v in checkpoint["model"].float().state_dict().items():
+            for k, v in checkpoint["model"].items():
                 if k in model.state_dict() and not any(x in k for x in exclude) and model.state_dict()[k].shape == v.shape:        # 根据key值, 筛选权重
                     ckpt_model[k] = v
             # 加载权重到模型
@@ -312,8 +306,12 @@ if __name__ == "__main__":
     model = YoloV5("/workspace/yolov5-pro/models/yolov5s-v2.yaml")
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01, betas=(0.90, 0.999))
     
-    scheduler = acquire_lr_scheduler(optimizer, epochs)
+    scheduler, _ = acquire_lr_scheduler(optimizer, lrf=0.15, epochs=epochs, cos_lr=True)
     plot_lr_scheduler(optimizer, scheduler, epochs, "./")
+    
+    
+    # for j, x in enumerate(optimizer.param_groups):
+    #     print(j, x)
 
     # parameters_group(model)
 
