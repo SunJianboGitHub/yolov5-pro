@@ -142,8 +142,8 @@ class YoloV5(nn.Module):
         
         
 
-    def forward(self, x, visualsize=False):
-        x = self._forward_once(x, visualsize)
+    def forward(self, x, visualize=False):
+        x = self._forward_once(x, visualize)
         return x
 
     
@@ -187,6 +187,69 @@ class YoloV5(nn.Module):
         
 
 
+class YoloV5Pruned(nn.Module):
+    def __init__(self, mask_bn_dict, yaml_cfg_file, new_anchors=None):
+        super().__init__()
+        self.mask_bn_dict = mask_bn_dict                                    # 所有BN层的掩码字典
+        with open(yaml_cfg_file, "r") as f:                                 # 打开yaml模型配置文件
+            self.yaml_dict = yaml.load(f, Loader=yaml.FullLoader)
+
+        self.num_classes = self.yaml_dict['nc']                             # 检测目标的类别数
+        if new_anchors:                                                     # 是否重新计算了anchors
+            self.yaml_dict['anchors'] = new_anchors
+        self.anchors = self.yaml_dict["anchors"]
+        
+        self.model, self.saved_index, self.from_to_map = parse_pruned_model(self.mask_bn_dict, self.yaml_dict)
+        
+        # 模型权重初始化, yolov5在这里只是进行默认初始化,设置一些参数而已
+        # 通常需要针对检测头进行合理初始化,才可加速模型收敛
+        initialize_weights(self.model)
+
+    
+    def forward(self, x, visualize=False):
+        x = self._forward_once(x, visualize)
+        return x
+
+    
+    def _forward_once(self, x, visualize=False):
+        saved_layers = []                                               # 保存网络层，不需保存的设置为None
+        for module_instance in self.model:
+            if module_instance.from_index != -1:                        # 该网络层的输入不是来自于之前的一层
+                if isinstance(module_instance.from_index, int):         # 说明该网络层只依赖一个输入
+                    x = saved_layers[module_instance.from_index]        # 从保存列表中取出输入层
+                else:                                                   # 说明该网络层不止一个输入，很可能是concat层
+                    x_list = []
+                    for i in module_instance.from_index:
+                        if i == -1:
+                            xvalue = x
+                        else:
+                            xvalue = saved_layers[i]
+                        x_list.append(xvalue)
+                    x = x_list
+            
+            x = module_instance(x)
+            if module_instance.layer_index in self.saved_index:
+                saved_layers.append(x)
+            else:
+                saved_layers.append(None)
+
+            if visualize == True:
+                feature_visualization(x, module_instance.module_type, module_instance.layer_index, max_n=32)
+        return x
+
+
+    # 吸BN, fuse model Conv2d + BN  -> Conv2d
+    # 这里只合并了Conv卷积里面的BN，concat之后的有些BN并没有合并
+    def fuse(self):
+        print("Fusing Conv2d+BN to  Conv2d layers...")
+        for m in self.model.modules():                                          # 遍历每一个网络层
+            if isinstance(m, (Conv, DWConv)) and hasattr(m, "bn"):              # 如果卷积是带BN的
+                m.conv = fuse_conv_and_bn(m.conv, m.bn)                         # 将卷积替换为合并后的卷积参数
+                delattr(m, "bn")                                                # 删除该网络层中的bn
+                m.forward = m.forward_fuse                                      # 修改卷积合并后的前向推理
+        print("Finished!")
+    
+    
 
 def eval_strings(item):
     with contextlib.suppress(NameError):
@@ -197,6 +260,141 @@ def parse_args(value):
         return eval(value)
     except Exception as e:
         return value
+
+
+
+# 解析裁剪的模型
+def parse_pruned_model(mask_bn_dict, yaml_dict, input_channel=3):
+    
+    LOGGER.info(f"\n{'':>38}{'layer_index':>3}{'from':>18}{'n':>3}{'params':>10}  {'module':<40}{'arguments':<30}")
+    anchors, num_cls = yaml_dict['anchors'], yaml_dict['nc']                                        # 设置anchors和检测的目标类别数
+    depth_multiple, width_multiple = yaml_dict['depth_multiple'], yaml_dict['width_multiple']       # 网络深度和宽度的扩增倍数
+    
+    na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors                           # 每一个特征层的anchor数目
+    no = (5 + num_cls) * na                                                                         # 每层输出的特征图的深度
+    
+    layers_cfg_list = yaml_dict['backbone'] + yaml_dict['head']                                     # 所有的网络层配置
+    layers_channel_list = [input_channel]                                                           # 用来存储所有网络层的输出通道数
+    layers_list = []                                                                                # 用来存储所有的layer
+    saved_layers_index = []                                                                         # 需要保存中间结果的层，用来拼接使用的
+    
+    # 裁剪专用
+    fromlayer = []                                                                                  # 上一个模块的BN层的名字
+    from_to_map = {}                                                                                # 上一层对应的map
+    
+    for layer_index, (from_index, repeat, module_name, args) in enumerate(layers_cfg_list):
+        module_name = eval_strings(module_name)                                                     # 解析 网络层模块的名称
+        args = [parse_args(item) for item in args]                                                  # 解析 网络层的参数
+        
+        repeat = n_ =  max(round(repeat * depth_multiple), 1) if repeat > 1 else repeat             # 该模块在深度方面的增益
+        named_m_base = "model.{}".format(layer_index)
+        if module_name in [Conv]:                                                                   # 如果是Conv卷积层
+            named_m_bn = named_m_base + ".bn"                                                       # BN层的名称
+            input_channel = layers_channel_list[from_index]                                         # 输入通道数
+            output_channel = int(mask_bn_dict[named_m_bn].sum())                                    # BN层剩余的通道数目, 输出通道数
+            args = [input_channel, output_channel, *args[1:]]                                       # args[0]是output_channel,args[1:]属于layer的特定参数
+            
+            if layer_index > 0:                                                                     # 第一个卷积层没有上一层BN，输入就是3通道
+                from_to_map[named_m_bn] = fromlayer[from_index]                                     # 当前卷积的BN层对应的上一层的BN名称
+            fromlayer.append(named_m_bn)                                                            # 当前层输出的BN名称
+
+        elif module_name in [C3Pruned]:
+            named_m_cv1_bn = named_m_base + ".cv1.bn"                                               # C3卷积中的cv1的BN层
+            named_m_cv2_bn = named_m_base + ".cv2.bn"                                               # C3卷积中的cv2的BN层
+            named_m_cv3_bn = named_m_base + ".cv3.bn"                                               # C3卷积中的cv3的BN层
+            from_to_map[named_m_cv1_bn] = fromlayer[from_index]                                     # C3卷积中的cv1卷积的输入来自上一个模块
+            from_to_map[named_m_cv2_bn] = fromlayer[from_index]                                     # C3卷积中的cv2卷积的输入来自上一个模块
+            fromlayer.append(named_m_cv3_bn)                                                        # 当前C3模块的输出,也就是下一个模块的输入
+            
+            cv1in = layers_channel_list[from_index]                                                 # C3卷积的cv1的输入
+            cv1out = int(mask_bn_dict[named_m_cv1_bn].sum())                                        # C3卷积的cv1的输出,这一层并不剪枝
+            cv2out = int(mask_bn_dict[named_m_cv2_bn].sum())                                        # C3卷积的cv2的输出,这一层剪枝
+            cv3out = int(mask_bn_dict[named_m_cv3_bn].sum())                                        # C3卷积的cv3的输出,这一层剪枝
+            args = [cv1in, cv1out, cv2out, cv3out, repeat, args[-1]]
+            
+            c3fromlayer = [named_m_cv1_bn]
+            bottle_args = []                                                                        # 瓶颈层参数
+            bottle_cv1in = cv1out                                                                   # 瓶颈层输入通道数
+            for p in range(repeat):                                                                 # 瓶颈层堆叠
+                named_m_bottle_cv1_bn = named_m_base + ".m.{}.cv1.bn".format(p)                     # 瓶颈层中的cv1卷积的BN
+                named_m_bottle_cv2_bn = named_m_base + ".m.{}.cv2.bn".format(p)                     # 瓶颈层中的cv2卷积的BN
+                bottle_cv1out = int(mask_bn_dict[named_m_bottle_cv1_bn].sum())                      # 瓶颈层中的cv1卷积的输出通道数,如果存在shortcut,不剪枝
+                bottle_cv2out = int(mask_bn_dict[named_m_bottle_cv2_bn].sum())                      # 瓶颈层中的cv2卷积的输出通道数,如果存在shortcut,不剪枝
+                bottle_args.append([bottle_cv1in, bottle_cv1out, bottle_cv2out])
+                
+                from_to_map[named_m_bottle_cv1_bn] = c3fromlayer[p]                                 # 瓶颈层中的cv1卷积的前一层输入的名称
+                from_to_map[named_m_bottle_cv2_bn] = named_m_bottle_cv1_bn                          # 瓶颈层中的cv2卷积的前一层是cv1的输出
+                c3fromlayer.append(named_m_bottle_cv2_bn)                                           # 记录当前瓶颈层的cv2卷积的输出，作为后续层的输入
+                         
+                bottle_cv1in = bottle_cv2out                                                        # 后续瓶颈层的输入通道数
+                
+            args.insert(4, bottle_args)                                                             # C3卷积的输入参数
+            output_channel = cv3out                                                                 # C3卷积的cv3卷积的输出就是整个C3的输出
+            repeat = 1                                                                              # 瓶颈层已经重复过了，这里设置为1
+            from_to_map[named_m_cv3_bn] = [c3fromlayer[-1], named_m_cv2_bn]                         # 这里记录C3卷积的cv3卷积的输入是最后一个瓶颈层的cv2的输出和C3卷积的cv2卷积输出
+        
+        elif module_name in [SPPFPruned]:
+            named_m_cv1_bn = named_m_base + ".cv1.bn"                                               # SPPF中的cv1卷积的BN层
+            named_m_cv2_bn = named_m_base + ".cv2.bn"                                               # SPPF中的cv2卷积的BN层
+            cv1in = layers_channel_list[from_index]                                                 # SPPF中cv1卷积的输入
+            
+            from_to_map[named_m_cv1_bn] = fromlayer[from_index]                                     # SPPF池化层的cv1卷积的输入
+            from_to_map[named_m_cv2_bn] = [named_m_cv1_bn] * 4                                      # SPPF池化层的cv2卷积的输入,拼接的4个通道数相等
+            fromlayer.append(named_m_cv2_bn)                                                        # 记录当前SPPF池化层的输出,便于其它网络层找到对应输入
+ 
+            cv1out = int(mask_bn_dict[named_m_cv1_bn].sum())                                        # SPPF中cv1卷积的输出
+            cv2out = int(mask_bn_dict[named_m_cv2_bn].sum())                                        # SPPF中cv2卷积的输出
+            
+            args = [cv1in, cv1out, cv2out, *args[1:]]                                               # SPPF中的输入参数
+            output_channel = cv2out                                                                 # SPPF最终的输出通道数
+            
+        elif module_name is Concat:                                                                 # 如果当前模块是拼接层
+            output_channel = 0                                                                      # 当前层的输出通道数
+            for index in from_index:                                                                # 遍历所需拼接的层数
+                if index != -1:
+                    index += 1
+                output_channel += layers_channel_list[index]                                        # 累加输出通道数
+                
+            inputtmp = [fromlayer[x] for x in from_index]                                           # Concat拼接层的输入来自那些层
+            fromlayer.append(inputtmp)                                                              # 当前层的输入来自那些层，这一层在复制权重时不需要操作
+            
+        elif module_name is Detect:
+            from_to_map[named_m_base + ".detect_heads.0"] = fromlayer[from_index[0]]                # 第一个检测层来自于那个输入
+            from_to_map[named_m_base + ".detect_heads.1"] = fromlayer[from_index[1]]                # 第二个检测层来自于那个输入
+            from_to_map[named_m_base + ".detect_heads.2"] = fromlayer[from_index[2]]                # 第三个检测层来自于那个输入
+            
+            reference_channels = [layers_channel_list[idx+1] for idx in from_index]                 # 各个检测头层的输入通道数
+            args = [num_cls, anchors, reference_channels]                                           # 检测层的参数
+        else:                                                                                       # 这里是指Upsample模块
+            output_channel = layers_channel_list[from_index]
+            fromlayer.append(fromlayer[-1])                                                         # 这里Upsample的输入来自上一个层
+        
+        # 开始构建
+        if repeat > 1:
+            module_instance = nn.ModuleList([module_name(*args) for _ in range(repeat)])
+        else:
+            module_instance = module_name(*args)
+        
+        num_params = sum(x.numel() for x in module_instance.parameters())                           # 计算当前网络层的参数量
+        module_type = str(module_name)[8:-2].replace('__main__.', '')                               # module type
+
+        module_instance.from_index = from_index
+        module_instance.layer_index = layer_index
+        module_instance.module_type = module_type
+        module_instance.num_params = num_params
+        
+        layers_channel_list.append(output_channel)                                                  # 记录当前模块的输出通道数
+
+        if not isinstance(from_index, list):
+            from_index = [from_index]
+
+        saved_layers_index.extend(filter(lambda idx: idx != -1, from_index))                        # 如果不是-1的层索引需要记录下来，前向传播时需要记录它们的输出
+
+        LOGGER.info(f'{layer_index:>3}{str(from_index):>18}{n_:>3}{num_params:10.0f}  {module_type:<40}{str(args):<30}')  # print
+
+        layers_list.append(module_instance)
+        
+    return nn.Sequential(*layers_list), sorted(saved_layers_index), from_to_map
 
 
 def parse_model(yaml_dict, input_channel=3):
@@ -271,6 +469,12 @@ def parse_model(yaml_dict, input_channel=3):
         layers_list.append(module_instance)
 
     return nn.Sequential(*layers_list), sorted(saved_layers_index)
+
+
+
+
+
+
 
 
 
