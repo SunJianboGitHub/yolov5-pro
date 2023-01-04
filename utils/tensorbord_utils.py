@@ -45,10 +45,11 @@ class LogRecoder:
                                 global_step=global_step)                # 对应的步长
         
     # 绘制图像,可以用来显示增强后的图像,或者检测结果图
-    def add_image(self, tag_name, img, global_step, dataformats="CHW"):
+    def add_image(self, tag_name, img, global_step, walltime, dataformats="CHW"):
         self.writer.add_image(tag=tag_name,                                 # 图像的名称
                               img_tensor=img,                           # 图像数值数据
                               global_step=global_step,                  # 步长
+                              walltime=walltime,
                               dataformats=dataformats)                  # 图像格式,默认应该是CHW
     
     # 绘制多张图像,可用来显示特征图
