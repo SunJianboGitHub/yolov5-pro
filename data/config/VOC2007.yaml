@@ -1,0 +1,38 @@
+# VOC2007数据集的路径
+# 包括训练集路径、验证集路径、测试集路径
+# 针对新训练集,只需要修改自己的放置路径
+
+
+train_path: /workspace/datasets/PASCAL_VOC2007/VOC2007_trainval/trainval_yolo.txt
+val_path: /workspace/datasets/PASCAL_VOC2007/VOC2007_trainval/val_yolo.txt
+test_path: /workspace/datasets/PASCAL_VOC2007/VOC2007_test/test_yolo.txt
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
