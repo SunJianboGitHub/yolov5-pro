@@ -30,7 +30,7 @@ from models.common import Conv, Bottleneck
 from models.yolo import YoloV5, YoloV5Pruned, Detect
 from prune.prune_tools import gather_bn_weights, obtain_bn_mask
 
-from utils.new_evaluate import estimate as new_estimate_coco
+from utils.evaluate_coco import estimate as new_estimate_coco
 
 
 def run_prune(percent=0.0):
