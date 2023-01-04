@@ -40,7 +40,7 @@ from utils.loss import ComputeLoss
 from utils.plots import draw_norm_bboxes
 from utils.evaluate import estimate as estimate_self
 from utils.coco_evauate import estimate as estimate_coco
-from utils.new_evaluate import estimate as new_estimate_coco
+from utils.evaluate_coco import estimate as new_estimate_coco
 from utils.general import setup_random_seed
 from utils.general import _single_instance_logger as logger
 from utils.torch_utils import smart_optimizer, smart_resume, acquire_lr_scheduler, load_pretrained_weights, ModelEMA
