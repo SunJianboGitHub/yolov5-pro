@@ -329,7 +329,7 @@ def convert_gt_bboxes_format(gt_bboxes, img_size=640):
 # 模型推理得到预测框,然后进行筛选出符合条件的最终预测框, conf > 阈值, 并且进行类间的NMS
 # 加载gt框到内存
 def generate_predicts_targets_dict(model, val_txt_path, img_size=640, batch_size=16, num_workers=16,
-                                   max_det=30000, nms_thres=0.5, conf_thres=0.001, device="cuda"):
+                                   max_det=30000, nms_thres=0.5, conf_thres=0.001, device="cuda", normalize=None):
     """
         ### 函数说明
             - 根据训练的模型对验证集数据进行推理,并将结果保存,用于计算mAP
@@ -369,6 +369,9 @@ def generate_predicts_targets_dict(model, val_txt_path, img_size=640, batch_size
         for i, (images, labels, visual_info) in pbar:
             tmp_img = images.numpy()                                                                # 用于模型检测效果展示
             images, labels = images.to(device).float() / 255, labels.to(device)
+            if normalize is not None:
+                images = torchvision.transforms.Normalize(mean=normalize[0], std=normalize[1])(images)
+                
             predicts = model(images).detach()
             predicts = non_max_suppression(predicts, nms_thres, conf_thres, max_det)        # 对预测结果进行batched_nms,                       
             for j in range(len(predicts)):
@@ -420,7 +423,7 @@ def recover_bbox(img_size, ori_h, ori_w, pt_bboxes):
 
 # 根据训练的模型，评估数据集，计算mAP
 def estimate(model, val_data_path, method="interp101", num_cls=20, image_size=640, batch_size=16, num_workers=16,
-                                   nms_max_output_det=30000, map_max_det=100, nms_thres=0.5, conf_thres=0.001, device="cuda"):
+                                   nms_max_output_det=30000, map_max_det=100, nms_thres=0.5, conf_thres=0.001, device="cuda", normalize=None):
     """_summary_
 
     参数说明:
@@ -442,7 +445,11 @@ def estimate(model, val_data_path, method="interp101", num_cls=20, image_size=64
     
     # all_pt_bboxes_dict = np.load("../data/all_pt_bboxes.npy", allow_pickle=True).item()
     # all_gt_bboxes_dict = np.load("../data/all_gt_bboxes.npy", allow_pickle=True).item()
-    all_pt_bboxes_dict, all_gt_bboxes_dict, show_gt_pt_dict = generate_predicts_targets_dict(model, val_data_path)
+    all_pt_bboxes_dict, all_gt_bboxes_dict, show_gt_pt_dict = generate_predicts_targets_dict(model, val_data_path,
+                                                                                             img_size=image_size, batch_size=batch_size, 
+                                                                                             num_workers=num_workers, max_det=nms_max_output_det, 
+                                                                                             nms_thres=nms_thres, conf_thres=conf_thres, 
+                                                                                             device=device, normalize=normalize)
     
 
     image = show_gt_pt_dict["image"]

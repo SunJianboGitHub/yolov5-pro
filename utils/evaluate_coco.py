@@ -19,12 +19,6 @@ sys.path.append("..")
 
 from utils.dataset import create_dataloader
 
-MEAN = [0.485, 0.456, 0.406]                                            # ImageNet上的图像均值, RGB通道
-STD  = [0.229, 0.224, 0.225]                                            # ImageNet上的图像标准差, RGB通道
-
-COCO_MEAN = [0.471, 0.448, 0.408]                                            # COCO上的图像均值, RGB通道
-COCO_STD  = [0.234, 0.239, 0.242]                                            # COCO上的图像标准差, RGB通道
-
 
 # 这个就是需要提供的label_map的样式
 VOC_NAMES = ["aeroplane", "bicycle", "bird", "boat","bottle", "bus", "car", "cat", "chair", "cow",
@@ -280,7 +274,7 @@ def show_compare_image(show_gt_pt_dict, label_map, conf_thres=0.25):
 
 # 根据模型和数据集生成gt/00001.json和pt/00001.json
 def generate_gt_pt_json(model, val_img_txt, prefix, img_size=640, batch_size=32, 
-                       num_workers=16, max_det=30000, nms_thres=0.5, conf_thres=0.001, device="cuda"):
+                       num_workers=16, max_det=30000, nms_thres=0.5, conf_thres=0.001, device="cuda", normalize=None):
     data_loader, data_sets = create_dataloader(datas_path=val_img_txt,
                                                hyp=None,
                                                shuffle=False,
@@ -310,7 +304,8 @@ def generate_gt_pt_json(model, val_img_txt, prefix, img_size=640, batch_size=32,
         for i, (images, labels, visual_info) in pbar:
             tmp_img = images.numpy()                                                                # 用于模型检测效果展示
             images = images.to(device, non_blocking=True).float() / 255
-            images = torchvision.transforms.Normalize(mean=COCO_MEAN, std=COCO_STD)(images)
+            if normalize is not None:
+                images = torchvision.transforms.Normalize(mean=normalize[0], std=normalize[1])(images)
             
             
             predictions = model(images).detach()
@@ -340,7 +335,7 @@ def generate_gt_pt_json(model, val_img_txt, prefix, img_size=640, batch_size=32,
 
 # 根据训练的模型，评估数据集，计算mAP
 def estimate(model, val_img_txt, prefix, label_map, image_size=640, batch_size=16, num_workers=16,
-                                   nms_max_output_det=30000, nms_thres=0.5, conf_thres=0.001, device="cuda"):
+                                   nms_max_output_det=30000, nms_thres=0.5, conf_thres=0.001, device="cuda", normalize=None):
 
     # print("Starting evalate validation dataset...")
     model.eval()
@@ -353,7 +348,7 @@ def estimate(model, val_img_txt, prefix, label_map, image_size=640, batch_size=1
                                                                     max_det=nms_max_output_det,
                                                                     nms_thres=nms_thres,
                                                                     conf_thres=conf_thres,
-                                                                    device=device)
+                                                                    device=device, normalize=normalize)
     
     # 展示预测结果和标注的区别
     show_image = show_compare_image(show_gt_pt_dict, label_map=label_map)       # 这里的label_map是一个类别列表
