@@ -191,7 +191,8 @@ class YoloV5Pruned(nn.Module):
     def __init__(self, mask_bn_dict, yaml_cfg_file, new_anchors=None):
         super().__init__()
         self.mask_bn_dict = mask_bn_dict                                    # 所有BN层的掩码字典
-        with open(yaml_cfg_file, "r") as f:                                 # 打开yaml模型配置文件
+        self.yaml_cfg_file = yaml_cfg_file
+        with open(self.yaml_cfg_file, "r") as f:                                 # 打开yaml模型配置文件
             self.yaml_dict = yaml.load(f, Loader=yaml.FullLoader)
 
         self.num_classes = self.yaml_dict['nc']                             # 检测目标的类别数
