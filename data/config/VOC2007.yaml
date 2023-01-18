@@ -4,7 +4,8 @@
 
 
 train_path: /workspace/datasets/PASCAL_VOC2007/VOC2007_trainval/trainval_yolo.txt
-val_path: /workspace/datasets/PASCAL_VOC2007/VOC2007_trainval/val_yolo.txt
+#val_path: /workspace/datasets/PASCAL_VOC2007/VOC2007_trainval/val_yolo.txt
+val_path: /workspace/datasets/PASCAL_VOC2007/VOC2007_test/test_yolo.txt
 test_path: /workspace/datasets/PASCAL_VOC2007/VOC2007_test/test_yolo.txt
 
 
