@@ -206,6 +206,12 @@ def record_evaluate_mAP(tbd_logs, ap50, ap75, mAP, epoch):
                                         "mAP@0.5:0.95": mAP}, global_step=epoch)
 
 
+def record_bn_distribution(tbd_logs, bn_weights, bn_biases, epoch):
+    tbd_logs.add_histogram(tag_name="distribution/st_bn_weights", values=bn_weights, global_step=epoch, bins="doane")
+    tbd_logs.add_histogram(tag_name="distribution/st_bn_bias", values=bn_biases, global_step=epoch, bins="doane")
+    pass
+
+
 
 # COCO API获得评估结果
 def acquire_evaluate_result(model, opts, data_path, normalize=None):
@@ -238,7 +244,7 @@ def save_model_to_disk(file_name, model, optimizer, epoch, best_map):
     ckpt = {
         "epoch": epoch, 
         "best_map": best_map,
-        "model": model.state_dict(),
+        "model": model,
         "optimizer": optimizer.state_dict(),
         "date": datetime.now().isoformat() 
     }
@@ -246,7 +252,18 @@ def save_model_to_disk(file_name, model, optimizer, epoch, best_map):
     del ckpt
     
 
-
+# 保存裁剪过(通道剪枝)的模型到本地
+def save_pruned_model_to_disk(file_name, model, optimizer, epoch, best_map):
+    # 如果是最后一轮就保存最后一轮的mAP
+    ckpt = {
+        "epoch": epoch, 
+        "best_map": best_map,
+        "model": model,
+        "optimizer": optimizer.state_dict(),
+        "date": datetime.now().isoformat() 
+    }
+    torch.save(ckpt, file_name)
+    del ckpt
 
 
 
