@@ -127,7 +127,7 @@ class AlbPixelAugment(object):
                 alb.RandomFog(),                                                                # 烟雾
                 alb.RandomSnow(),                                                               # 雪花
                 alb.MultiplicativeNoise(),                                                      # 图像直接乘以一个数值(随机噪声)
-                alb.RandomSunFlare(),                                                           # 太阳耀斑
+                # alb.RandomSunFlare(),                                                           # 太阳耀斑
                 alb.RandomGamma(),                                                              # 
                 # alb.RandomGridShuffle(),                                                        # 将grid_cell进行shuffle
                 alb.RandomShadow(),                                                             # 模拟图像阴影
