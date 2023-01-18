@@ -11,6 +11,7 @@
 
 import math
 import torch
+import torchvision
 import torch.nn as nn
 from copy import deepcopy
 
@@ -107,9 +108,9 @@ def acquire_lr_scheduler(optimizer, lrf=0.001, epochs=100, cos_lr=True, T=100, d
             4. cos_lr, 选择余弦学习率,还是线性学习率
     """
     if cos_lr:
-        # lf = lambda x: ((1 + math.cos(x * math.pi / epochs)) / 2) * (1 - lrf) + lrf                                           # 余弦退火学习率,yolov5中的one_cycle就是余弦衰减
+        lf = lambda x: ((1 + math.cos(x * math.pi / epochs)) / 2) * (1 - lrf) + lrf                                           # 余弦退火学习率,yolov5中的one_cycle就是余弦衰减
         # lf = lambda x: ((1 + math.cos((x % T) * math.pi / T)) / 2) * (1 - lrf) + lrf                                          # 余弦退火 + 周期性重启 
-        lf = lambda x: (((1 + math.cos((x % T) * math.pi / T)) / 2) * (1 - lrf) + lrf) * (decay_rate ** (int(x / T)))           # 余弦退火 + 周期性重启 + 峰值衰减
+        # lf = lambda x: (((1 + math.cos((x % T) * math.pi / T)) / 2) * (1 - lrf) + lrf) * (decay_rate ** (int(x / T)))           # 余弦退火 + 周期性重启 + 峰值衰减
     else:
         lf = lambda x: (1 - x / (epochs - 1)) * (1.0 - lrf) + lrf                                    # 线性学习效率
         
@@ -177,7 +178,7 @@ def smart_resume(model, optimizer, weights="yolov5s.pt", device=None, epochs=300
     checkpoint = torch.load(weights, map_location="cpu")                                    # 加载检查点文件到指定设备
     
     # 开始逐步恢复
-    model.load_state_dict(checkpoint["model"])                                              # 恢复模型权重 
+    model.load_state_dict(checkpoint["model"].float().state_dict())                                              # 恢复模型权重 
                
     if checkpoint["optimizer"] is not None:                                                                 # 如果检查点文件中包括优化器参数
         optimizer.load_state_dict(checkpoint["optimizer"])                                                  # 加载优化器参数  
@@ -213,7 +214,7 @@ def load_pretrained_weights(model, weights="weights/yolov5s.pt", device=None):
         try:
             exclude = ["anchor"]                                            # 需要排除的keys, 每个任务的anchor是不同的,因此不需要加载
             ckpt_model = dict()
-            for k, v in checkpoint["model"].items():
+            for k, v in checkpoint["model"].float().state_dict().items():
                 if k in model.state_dict() and not any(x in k for x in exclude) and model.state_dict()[k].shape == v.shape:        # 根据key值, 筛选权重
                     ckpt_model[k] = v
             # 加载权重到模型
@@ -224,10 +225,7 @@ def load_pretrained_weights(model, weights="weights/yolov5s.pt", device=None):
                 "Please delete or update %s and try again, or use --weights '' to train from scratch." \
                 % (weights, weights, weights)
             raise KeyError(s) from e
-        
-
-
-
+    return  
 
 
 # 模型的指数滑动平均
@@ -271,8 +269,70 @@ class ModelEMA:
                     v *= beta
                     v += (1 - beta) * msd[k].detach()
             
+
+def xywh2xyxy(bboxes):
+    """
+        ### 函数说明
+            - 转换多个边界框的坐标
+            - bboxes: [N, 4], [x, y, w, h]
+    """
+    left   = bboxes[:, 0] - (bboxes[:, 2] - 1) * 0.5
+    right  = bboxes[:, 0] + (bboxes[:, 2] - 1) * 0.5
+    top    = bboxes[:, 1] - (bboxes[:, 3] - 1) * 0.5
+    bottom = bboxes[:, 1] + (bboxes[:, 3] - 1) * 0.5
+    bboxes[:, 0] = left
+    bboxes[:, 1] = top
+    bboxes[:, 2] = right
+    bboxes[:, 3] = bottom
+    return bboxes
+
+
+    
+# 非极大值抑制,NMS
+def non_max_suppression(predictions, iou_thres=0.45, conf_thres=0.001, max_output_det=30000):
+    '''
+        ### Params
+            - predictions: [[N, 5+20], [N, 5+20], ...], [x, y, w, h, conf, cls_p1, cls_p2...]
+            - iou_thres: 通常设置为0.5
+            - conf_thres: 计算mAP时,设置为0.001, 推理时,一般设置为0.25
+        ### 执行过程说明
+    '''
+    assert isinstance(predictions, torch.Tensor)
+    assert 0 <= conf_thres <= 1
+    assert 0 <= iou_thres <= 1
+    
+    max_nms = 30000                                                              # torchvision.ops.nms()处理的最大box数量
+    
+    bs = predictions.shape[0]                                                    # 批量大小
+    output = [torch.zeros((0, 6), device=predictions.device)] * bs               # 输出列表,每个元素就是一张图像的预测结果
+    
+    select_mask = predictions[..., 4] > conf_thres                  # 维度是[bs, num_boxes]=[bs, 25200]
+    for i, predict in enumerate(predictions):
+        predict = predict[select_mask[i]]
+        bboxes = xywh2xyxy(predict[:, :4])
+        if predict.shape[1] == 6:
+            predict[:, 5:] = 1
+        predict[:, 5:] *= predict[:, 4:5]
+        score, cls_id = predict[:, 5:].max(1, keepdim=True)
+        predict = torch.cat((bboxes, score, cls_id.float()), dim=1)[score.view(-1) > conf_thres]
         
+        num_box = predict.shape[0]
         
+        if not num_box:
+            continue
+        elif num_box > max_nms:
+            predict = predict[predict[:, 4].argsort(descending=True)[:max_nms]]
+        else:
+            predict = predict[predict[:, 4].argsort(descending=True)]
+
+        bboxes, scores, cls_ids = predict[:, :4], predict[:, 4], predict[:, 5]
+        keep_idx = torchvision.ops.batched_nms(bboxes, scores, cls_ids, iou_thres)
+        
+        if keep_idx.shape[0] > max_output_det:                                       #只输出 一张图像的最大预测数目的边界框,和计算mAP还不太一样
+            keep_idx = keep_idx[:max_output_det]
+        
+        output[i] = predict[keep_idx]
+    return output
         
         
         
